@@ -34,6 +34,15 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-ECR-Push
 
+      - name: Create ECR repository if it doesn't exist
+        run: |
+          aws ecr describe-repositories --repository-names ${{ env.ECR_REPO }} --region ${{ env.AWS_REGION }} 2>/dev/null || \
+          aws ecr create-repository \
+            --repository-name ${{ env.ECR_REPO }} \
+            --image-scanning-configuration scanOnPush=true \
+            --region ${{ env.AWS_REGION }} && \
+          echo "✅ ECR repository created: ${{ env.ECR_REPO }}"
+
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
