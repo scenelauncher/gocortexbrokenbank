@@ -6,10 +6,6 @@
 name: Build and Push to AWS ECR
 
 on:
-  push:
-    branches:
-      - main
-      - 'plan/**'
   workflow_dispatch:
 
 env:
