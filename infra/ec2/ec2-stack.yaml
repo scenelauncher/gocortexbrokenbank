@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'GoCortex Broken Bank EC2 Instance with Docker and SSM'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: t3.medium
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+  
+  KeyPairName:
+    Type: String
+    Description: Optional EC2 key pair for SSH access (leave empty for SSM-only access)
+    Default: ''
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for the instance
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID (use public subnet for quickstart)
+  
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: Latest Amazon Linux 2023 AMI
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+Resources:
+  # Security Group - No inbound rules, SSM access only
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: gocortex-brokenbank-sg
+      GroupDescription: Security group for GoCortex Broken Bank - No inbound access
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: gocortex-brokenbank-sg
+        - Key: Project
+          Value: gocortex-broken-bank
+
+  # IAM Role for EC2 Instance
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GoCortexBrokenBank-EC2-Role
+      Description: IAM role for GoCortex Broken Bank EC2 instance
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ECRPullPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ECRPullAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+              - Sid: CloudWatchLogsAccess
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/gocortex-broken-bank/*'
+      Tags:
+        - Key: Project
+          Value: gocortex-broken-bank
+
+  # Instance Profile
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: GoCortexBrokenBank-EC2-Profile
+      Roles:
+        - !Ref InstanceRole
+
+  # EC2 Instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      SubnetId: !Ref SubnetId
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # User data script for GoCortex Broken Bank EC2 instance
+          # Amazon Linux 2023 - Installs Docker, Docker Compose, SSM Agent
+
+          # Update system
+          dnf update -y
+
+          # Install Docker
+          dnf install -y docker
+          systemctl enable docker
+          systemctl start docker
+
+          # Add ec2-user to docker group
+          usermod -aG docker ec2-user
+
+          # Install Docker Compose plugin
+          DOCKER_CONFIG=$${DOCKER_CONFIG:-/usr/local/lib/docker}
+          mkdir -p $$DOCKER_CONFIG/cli-plugins
+          curl -SL https://github.com/docker/compose/releases/download/v2.24.5/docker-compose-linux-x86_64 -o $$DOCKER_CONFIG/cli-plugins/docker-compose
+          chmod +x $$DOCKER_CONFIG/cli-plugins/docker-compose
+
+          # Create application directory
+          mkdir -p /opt/brokenbank/instance
+          chmod -R 755 /opt/brokenbank
+
+          # Create docker-compose.yml
+          cat > /opt/brokenbank/docker-compose.yml <<'EOFCOMPOSE'
+          services:
+            gocortex-broken-bank:
+              image: $${AWS_ACCOUNT_ID}.dkr.ecr.$${AWS_REGION}.amazonaws.com/$${ECR_REPO}:$${IMAGE_TAG:-latest}
+              container_name: gocortex-broken-bank
+              restart: unless-stopped
+              ports:
+                - "127.0.0.1:8888:8888"
+                - "127.0.0.1:8080:8080"
+              environment:
+                - SESSION_SECRET=$${SESSION_SECRET:-hardcoded-docker-secret-key}
+                - DATABASE_URL=sqlite:///app/instance/gocortexbrokenbank.db
+                - FLASK_ENV=production
+                - LOCALE=$${LOCALE:-en}
+              volumes:
+                - /opt/brokenbank/instance:/app/instance
+              logging:
+                driver: "json-file"
+                options:
+                  max-size: "10m"
+                  max-file: "3"
+              healthcheck:
+                test: ["CMD", "curl", "-f", "http://localhost:8888/", "&&", "curl", "-f", "http://localhost:8080/"]
+                interval: 30s
+                timeout: 3s
+                start_period: 10s
+                retries: 3
+          EOFCOMPOSE
+
+          # Create deployment script
+          cat > /opt/brokenbank/deploy.sh <<'EOFDEPLOY'
+          #!/bin/bash
+          set -e
+          cd /opt/brokenbank
+          export AWS_REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+          export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          export ECR_REPO=$${ECR_REPO:-gocortex-broken-bank}
+          export IMAGE_TAG=$${IMAGE_TAG:-latest}
+          echo "Deploying GoCortex Broken Bank..."
+          aws ecr get-login-password --region $$AWS_REGION | docker login --username AWS --password-stdin $$AWS_ACCOUNT_ID.dkr.ecr.$$AWS_REGION.amazonaws.com
+          docker compose pull
+          docker compose up -d
+          echo "Deployment complete!"
+          docker compose ps
+          EOFDEPLOY
+
+          chmod +x /opt/brokenbank/deploy.sh
+
+          # Ensure SSM Agent is running
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+
+          echo "EC2 instance bootstrap complete!"
+      Tags:
+        - Key: Name
+          Value: gocortex-brokenbank
+        - Key: Project
+          Value: gocortex-broken-bank
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+  
+  InstancePrivateIp:
+    Description: Private IP address of the instance
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIp'
+  
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref InstanceSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityGroupId'
+  
+  SSMSessionCommand:
+    Description: Command to start SSM session
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --region ${AWS::Region}'
+  
+  SSMPortForwardFlask:
+    Description: Command to forward Flask port (8888)
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --document-name AWS-StartPortForwardingSession --parameters "portNumber=8888,localPortNumber=8888" --region ${AWS::Region}'
+  
+  SSMPortForwardTomcat:
+    Description: Command to forward Tomcat port (8080->9999)
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --document-name AWS-StartPortForwardingSession --parameters "portNumber=8080,localPortNumber=9999" --region ${AWS::Region}'

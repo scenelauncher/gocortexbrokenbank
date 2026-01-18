@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'GitHub OIDC Provider and IAM Role for GoCortex Broken Bank CI/CD'
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization or username
+    Default: scenelauncher
+  
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+    Default: gocortexbrokenbank
+  
+  GitHubBranch:
+    Type: String
+    Description: GitHub branch name (use * for all branches)
+    Default: main
+
+Resources:
+  # GitHub OIDC Identity Provider
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+      Tags:
+        - Key: Project
+          Value: gocortex-broken-bank
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # IAM Role for GitHub Actions
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GitHubActions-GoCortexBrokenBank
+      Description: Role for GitHub Actions to deploy GoCortex Broken Bank to EC2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOIDCProvider.Arn
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com'
+              StringLike:
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/${GitHubBranch}'
+      ManagedPolicyArns:
+        - !Ref GitHubActionsPolicy
+      MaxSessionDuration: 3600
+      Tags:
+        - Key: Project
+          Value: gocortex-broken-bank
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Custom IAM Policy for GitHub Actions
+  GitHubActionsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: GitHubActions-GoCortexBrokenBank-Policy
+      Description: Policy for GitHub Actions to push to ECR and deploy via SSM
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ECRPushPull
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:DescribeRepositories
+              - ecr:ListImages
+              - ecr:DescribeImages
+            Resource: '*'
+          - Sid: SSMSendCommand
+            Effect: Allow
+            Action:
+              - ssm:SendCommand
+              - ssm:GetCommandInvocation
+              - ssm:ListCommandInvocations
+            Resource:
+              - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+              - !Sub 'arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript'
+              - !Sub 'arn:aws:ssm:${AWS::Region}::document/AWS-RunDocument'
+            Condition:
+              StringEquals:
+                'ssm:resourceTag/Project': 'gocortex-broken-bank'
+          - Sid: EC2DescribeInstances
+            Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceStatus
+              - ec2:DescribeTags
+            Resource: '*'
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/gocortex-broken-bank/*'
+
+Outputs:
+  GitHubOIDCProviderArn:
+    Description: ARN of the GitHub OIDC Provider
+    Value: !GetAtt GitHubOIDCProvider.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OIDCProviderArn'
+  
+  GitHubActionsRoleArn:
+    Description: ARN of the IAM Role for GitHub Actions
+    Value: !GetAtt GitHubActionsRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
+  
+  GitHubActionsRoleName:
+    Description: Name of the IAM Role for GitHub Actions
+    Value: !Ref GitHubActionsRole
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleName'

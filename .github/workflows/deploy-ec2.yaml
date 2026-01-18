@@ -1,0 +1,136 @@
+# Deploy to EC2 via SSM
+# Uses OIDC to authenticate and SSM SendCommand to deploy
+# Requires GitHub Variables: AWS_REGION, AWS_ROLE_ARN, EC2_INSTANCE_ID, ECR_REPO
+# Optional Variables: IMAGE_TAG (defaults to 'latest')
+
+name: Deploy to EC2
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: false
+        default: 'latest'
+        type: string
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+  ECR_REPO: ${{ vars.ECR_REPO }}
+  IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-EC2-Deploy
+
+      - name: Verify EC2 instance is reachable via SSM
+        run: |
+          echo "Checking if instance ${{ env.EC2_INSTANCE_ID }} is online..."
+          aws ssm describe-instance-information \
+            --filters "Key=InstanceIds,Values=${{ env.EC2_INSTANCE_ID }}" \
+            --query "InstanceInformationList[0].PingStatus" \
+            --output text
+
+      - name: Deploy via SSM
+        id: deploy
+        run: |
+          echo "Deploying image: ${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}"
+          
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy GoCortex Broken Bank" \
+            --parameters commands='[
+              "export AWS_REGION=${{ env.AWS_REGION }}",
+              "export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)",
+              "export ECR_REPO=${{ env.ECR_REPO }}",
+              "export IMAGE_TAG=${{ env.IMAGE_TAG }}",
+              "cd /opt/brokenbank",
+              "echo \"Pulling image: $ECR_REPO:$IMAGE_TAG\"",
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com",
+              "docker compose pull",
+              "docker compose up -d",
+              "docker compose ps",
+              "echo \"Deployment complete!\""
+            ]' \
+            --output-s3-bucket-name "" \
+            --query "Command.CommandId" \
+            --output text)
+          
+          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
+          echo "Command ID: $COMMAND_ID"
+
+      - name: Wait for deployment to complete
+        run: |
+          echo "Waiting for command ${{ steps.deploy.outputs.command_id }} to complete..."
+          
+          aws ssm wait command-executed \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}"
+          
+          echo "Deployment command completed!"
+
+      - name: Get deployment output
+        run: |
+          echo "Fetching command output..."
+          
+          OUTPUT=$(aws ssm get-command-invocation \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+            --query "StandardOutputContent" \
+            --output text)
+          
+          ERROR_OUTPUT=$(aws ssm get-command-invocation \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+            --query "StandardErrorContent" \
+            --output text)
+          
+          echo "### 🚀 Deployment Output" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Instance:** ${{ env.EC2_INSTANCE_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Standard Output:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "$OUTPUT" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          if [ ! -z "$ERROR_OUTPUT" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Standard Error:**" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "$ERROR_OUTPUT" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Verify deployment
+        run: |
+          echo "Verifying container health..."
+          
+          HEALTH_CHECK=$(aws ssm send-command \
+            --instance-ids "${{ env.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["cd /opt/brokenbank && docker compose ps && docker inspect gocortex-broken-bank --format=\"{{.State.Health.Status}}\""]' \
+            --query "Command.CommandId" \
+            --output text)
+          
+          sleep 5
+          
+          aws ssm get-command-invocation \
+            --command-id "$HEALTH_CHECK" \
+            --instance-id "${{ env.EC2_INSTANCE_ID }}" \
+            --query "StandardOutputContent" \
+            --output text

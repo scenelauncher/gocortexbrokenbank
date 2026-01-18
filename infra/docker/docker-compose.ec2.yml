@@ -1,0 +1,39 @@
+# GoCortex Broken Bank - EC2 Docker Compose Configuration
+# This configuration binds ports to 127.0.0.1 only for SSM port forwarding access
+# No external network access - secure private deployment
+
+services:
+  gocortex-broken-bank:
+    image: ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG:-latest}
+    container_name: gocortex-broken-bank
+    restart: unless-stopped
+    ports:
+      # Bind to localhost only - accessible via SSM port forwarding
+      - "127.0.0.1:8888:8888"   # Flask/Gunicorn - Banking UI and SAST endpoints
+      - "127.0.0.1:8080:8080"   # Tomcat - Java exploit endpoints and Spring4Shell
+    environment:
+      - SESSION_SECRET=${SESSION_SECRET:-hardcoded-docker-secret-key}
+      - DATABASE_URL=sqlite:///app/instance/gocortexbrokenbank.db
+      - FLASK_ENV=production
+      - LOCALE=${LOCALE:-en}
+      # Optional: Add log shipping endpoints if configured
+      - LOG_ENDPOINT_TOMCAT_ACCESS=${LOG_ENDPOINT_TOMCAT_ACCESS:-}
+      - LOG_ENDPOINT_NETBANK_APP=${LOG_ENDPOINT_NETBANK_APP:-}
+      - LOG_ENDPOINT_NETBANK_AUTH=${LOG_ENDPOINT_NETBANK_AUTH:-}
+      - LOG_AUTH_TOMCAT_ACCESS=${LOG_AUTH_TOMCAT_ACCESS:-}
+      - LOG_AUTH_NETBANK_APP=${LOG_AUTH_NETBANK_APP:-}
+      - LOG_AUTH_NETBANK_AUTH=${LOG_AUTH_NETBANK_AUTH:-}
+    volumes:
+      # Persistent storage on EC2 host
+      - /opt/brokenbank/instance:/app/instance
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/", "&&", "curl", "-f", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
